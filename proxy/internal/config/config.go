@@ -48,12 +48,10 @@ type Config struct {
 	// may only default on under the local-wrap clause (recovery + CCR) —
 	// which it does not; it stays an explicit opt-in.
 	ToolSchemaStrip string `yaml:"toolschema_strip"`
-	// BreakpointPlan selects the cache-breakpoint planner. It is DEFAULT OFF: only
-	// the explicit value "frontier" turns it on, and "", "off", and any
-	// unrecognized value all mean off. The planner adds provider-native cache
-	// metadata (Anthropic cache_control, OpenAI prompt_cache_key) to the upstream
-	// request only, so it changes no model-visible bytes — but it stays off until
-	// the escalation ladder has priced it.
+	// BreakpointPlan selects the cache-breakpoint planner. Empty defaults to
+	// "frontier" so optimization modes need no cache-specific setup. Explicit
+	// "off" and unrecognized values fail closed. Planner metadata changes no
+	// model-visible bytes; record mode remains an unconditional pass-through.
 	BreakpointPlan string `yaml:"breakpoint_plan"`
 	// ObserveEstimate turns on record-mode observe-only estimation. When true AND
 	// Mode is "record", the proxy runs the compressor on COPIES of each live-zone
@@ -178,15 +176,22 @@ func (c Config) withDefaults() Config {
 	default:
 		c.ToolSchemaStrip = "off"
 	}
-	// Same normalization discipline: one spelling of off, so the decision point is
-	// a single equality against "frontier".
+	// Cache planning is safe metadata and defaults on in optimization modes. Keep
+	// one explicit off spelling and fail closed for unknown values.
 	switch c.BreakpointPlan {
-	case "frontier":
+	case "":
+		c.BreakpointPlan = "frontier"
+	case "frontier", "off":
 	default:
 		c.BreakpointPlan = "off"
 	}
 	if c.Optimizers == nil {
 		c.Optimizers = map[string]bool{}
+	}
+	for _, optimizerID := range []string{"anthropic-cache-breakpoints", "openai-prompt-cache-key", "bedrock-cache-points"} {
+		if _, configured := c.Optimizers[optimizerID]; !configured {
+			c.Optimizers[optimizerID] = true
+		}
 	}
 	return c
 }
@@ -306,11 +311,38 @@ func (c Config) Credential(provider string) providers.Credential {
 	return providers.Credential{Mode: "ephemeral_header"}
 }
 
-// CompatCredential returns the named OpenAI-compatible upstream key, plus
-// whether that upstream exists. An empty api_key_env intentionally means no
-// Authorization header for that named upstream.
+// builtinCompat holds the named OpenAI-compatible upstreams that work with no
+// user config. The standalone proxy mounts each one at /compat/<name>/, and
+// CompatCredential resolves its key. Thus one table gives a mount and its BYOK
+// policy. A caveman.yaml compat entry with the same name replaces the built-in
+// entry.
+var builtinCompat = map[string]CompatConfig{
+	// OpenCode Go uses the OpenAI and Anthropic wire protocols, but its upstream
+	// is not api.openai.com. Its key comes from OPENCODE_API_KEY, as in Pi.
+	"opencode-go": {BaseURL: "https://opencode.ai/zen/go", APIKeyEnv: "OPENCODE_API_KEY"},
+}
+
+// CompatUpstreams returns every named OpenAI-compatible upstream that the proxy
+// mounts. The result starts with the built-in table. Then the caveman.yaml
+// entries go on top, so a user entry with a built-in name replaces the built-in
+// entry. The result is a new map.
+func (c Config) CompatUpstreams() map[string]CompatConfig {
+	merged := make(map[string]CompatConfig, len(builtinCompat)+len(c.Compat))
+	for name, upstream := range builtinCompat {
+		merged[name] = upstream
+	}
+	for name, upstream := range c.Compat {
+		merged[name] = upstream
+	}
+	return merged
+}
+
+// CompatCredential returns the key of one named OpenAI-compatible upstream. The
+// second result is false if no built-in entry and no configured entry has this
+// name. An empty api_key_env means that the upstream needs no Authorization
+// header.
 func (c Config) CompatCredential(name string) (string, bool) {
-	upstream, ok := c.Compat[name]
+	upstream, ok := c.CompatUpstreams()[name]
 	if !ok {
 		return "", false
 	}

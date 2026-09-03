@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -92,6 +93,63 @@ func TestStandaloneBoot_ZeroCloudDeps_InferredRows(t *testing.T) {
 	}
 	if stats.Basis != "inferred" {
 		t.Errorf("basis = %q, want inferred (standalone never claims verified)", stats.Basis)
+	}
+}
+
+func TestStandaloneActiveModeAutoCachesAcrossProvidersAndModelSwitches(t *testing.T) {
+	t.Setenv("CAVEMAN_MODE", "active")
+	t.Setenv("CAVEMAN_BREAKPOINT_PLAN", "")
+	cfg, err := config.Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err != nil {
+		t.Fatalf("load defaults: %v", err)
+	}
+	upstream := &captureUpstreamTransport{response: `{}`}
+	spend, err := store.Open(filepath.Join(t.TempDir(), "caveman.db"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spend.Close()
+	srv := New(cfg, spend, Options{HTTPClient: &http.Client{Transport: upstream}})
+
+	send := func(path, body string) []byte {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("x-api-key", "provider-test-key")
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+		return bytes.Clone(upstream.body)
+	}
+
+	anthropicBody := send("/anthropic/v1/messages", `{"model":"claude-sonnet-4-6","max_tokens":64,"tools":[{"name":"workspace","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":"inspect"}]}`)
+	if !bytes.Contains(anthropicBody, []byte(`"cache_control"`)) {
+		t.Fatalf("Anthropic default missed cache breakpoint: %s", anthropicBody)
+	}
+	bedrockBody := send("/bedrock/model/global.anthropic.claude-sonnet-4-6/converse", `{"system":[{"text":"stable policy"}],"messages":[{"role":"user","content":[{"text":"inspect"}]}]}`)
+	if !bytes.Contains(bedrockBody, []byte(`"cachePoint"`)) {
+		t.Fatalf("Bedrock default missed cache point: %s", bedrockBody)
+	}
+
+	openAIKey := func(model string) string {
+		t.Helper()
+		body := send("/openai/v1/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"system","content":"stable policy"},{"role":"user","content":"inspect"}]}`, model))
+		var root map[string]any
+		if err := json.Unmarshal(body, &root); err != nil {
+			t.Fatalf("decode OpenAI body: %v", err)
+		}
+		key, _ := root["prompt_cache_key"].(string)
+		if key == "" {
+			t.Fatalf("OpenAI default missed prompt_cache_key: %s", body)
+		}
+		return key
+	}
+	first := openAIKey("gpt-5.6")
+	switched := openAIKey("gpt-5.6-sol")
+	back := openAIKey("gpt-5.6")
+	if first == switched || first != back {
+		t.Fatalf("model cache lanes not isolated/stable: first=%q switched=%q back=%q", first, switched, back)
 	}
 }
 
@@ -695,6 +753,49 @@ func TestBuildAdapters_RegistersNamedCompatBeforeLegacy(t *testing.T) {
 	}
 	if !matched {
 		t.Fatal("no adapter matched legacy compat route")
+	}
+}
+
+func TestBuildAdapters_OpenCodeGoRouteUsesOpenCodeUpstream(t *testing.T) {
+	adapters := buildAdapters(config.Config{})
+	req := httptest.NewRequest(http.MethodPost, "/compat/opencode-go/v1/responses", nil)
+	for _, adapter := range adapters {
+		if adapter.Name() != "openai_compatible" || !adapter.MatchRoute(req.Method, req.URL.Path) {
+			continue
+		}
+		upstream, err := adapter.ResolveUpstreamURL(req.Context(), req, providers.RouteContext{})
+		if err != nil {
+			t.Fatalf("resolve OpenCode Go route: %v", err)
+		}
+		want := "https://opencode.ai/zen/go/v1/responses"
+		if got := upstream.String(); got != want {
+			t.Fatalf("OpenCode Go upstream = %q, want %q", got, want)
+		}
+		return
+	}
+	t.Fatal("built-in OpenCode Go adapter was not registered")
+}
+
+// TestCreds_OpenCodeGoBuiltinCompatCredential proves that the built-in OpenCode
+// Go mount has its own BYOK policy. The proxy adds this mount only if the user
+// config has no opencode-go entry. Thus a keyless request must not use the wrong
+// OPENAI_COMPAT_API_KEY secret. A user entry must still win.
+func TestCreds_OpenCodeGoBuiltinCompatCredential(t *testing.T) {
+	t.Setenv("OPENCODE_API_KEY", "sk-opencode")
+	t.Setenv("OPENAI_COMPAT_API_KEY", "sk-legacy")
+
+	builtin := Creds{cfg: config.Config{}}
+	req := httptest.NewRequest(http.MethodPost, "/compat/opencode-go/v1/responses", nil)
+	if got := builtin.Resolve("openai_compatible", req); got.Key != "sk-opencode" || got.AuthFallbackEnv != "OPENCODE_API_KEY" {
+		t.Errorf("built-in OpenCode Go credential = %+v, want OPENCODE_API_KEY key and fallback policy", got)
+	}
+
+	t.Setenv("OPENCODE_ZEN_API_KEY", "sk-user")
+	configured := Creds{cfg: config.Config{Compat: map[string]config.CompatConfig{
+		"opencode-go": {BaseURL: "https://opencode.example.test", APIKeyEnv: "OPENCODE_ZEN_API_KEY"},
+	}}}
+	if got := configured.Resolve("openai_compatible", req); got.Key != "sk-user" || got.AuthFallbackEnv != "OPENCODE_ZEN_API_KEY" {
+		t.Errorf("configured OpenCode Go credential = %+v, want the user api_key_env to win", got)
 	}
 }
 

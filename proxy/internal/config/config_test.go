@@ -3,7 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/JuliusBrussee/caveman/proxy/providers/openaicompat"
 )
 
 func TestLoad_MissingFileYieldsRecordDefaults(t *testing.T) {
@@ -168,6 +171,34 @@ func TestLoad_ParsesProvidersAndOptimizers(t *testing.T) {
 	}
 }
 
+func TestLoad_CacheOptimizersDefaultOnWithExplicitOff(t *testing.T) {
+	t.Setenv("CAVEMAN_BREAKPOINT_PLAN", "")
+	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	for _, optimizerID := range []string{"anthropic-cache-breakpoints", "openai-prompt-cache-key", "bedrock-cache-points"} {
+		if !cfg.Optimizers[optimizerID] {
+			t.Fatalf("default optimizer %q disabled: %#v", optimizerID, cfg.Optimizers)
+		}
+	}
+
+	path := filepath.Join(t.TempDir(), "caveman.yaml")
+	if err := os.WriteFile(path, []byte("optimizers:\n  openai-prompt-cache-key: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatalf("load explicit off: %v", err)
+	}
+	if cfg.Optimizers["openai-prompt-cache-key"] {
+		t.Fatal("explicit OpenAI cache off-switch was overwritten")
+	}
+	if !cfg.Optimizers["anthropic-cache-breakpoints"] || !cfg.Optimizers["bedrock-cache-points"] {
+		t.Fatalf("unconfigured cache defaults lost: %#v", cfg.Optimizers)
+	}
+}
+
 func TestLoad_ParsesCompatUpstreams(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "caveman.yaml")
 	yaml := "compat:\n" +
@@ -310,6 +341,57 @@ func TestCompatCredential_UsesPerNameEnvAndEmptyMeansNoAuth(t *testing.T) {
 	}
 }
 
+// A built-in compat mount has its own BYOK policy with no user config. Thus a
+// keyless request never uses the OPENAI_COMPAT_API_KEY secret.
+func TestCompatCredential_BuiltinMountReadsItsOwnEnv(t *testing.T) {
+	t.Setenv("OPENCODE_API_KEY", "sk-opencode")
+	t.Setenv("OPENAI_COMPAT_API_KEY", "sk-legacy")
+	if got, ok := (Config{}).CompatCredential("opencode-go"); !ok || got != "sk-opencode" {
+		t.Errorf("opencode-go credential = (%q,%v), want (sk-opencode,true)", got, ok)
+	}
+}
+
+func TestCompatUpstreams_UserEntryWins(t *testing.T) {
+	builtin := Config{}.CompatUpstreams()
+	if got := builtin["opencode-go"].BaseURL; got != "https://opencode.ai/zen/go" {
+		t.Fatalf("built-in opencode-go base_url = %q, want the OpenCode Go upstream", got)
+	}
+	user := CompatConfig{BaseURL: "https://opencode.example.test", APIKeyEnv: "OPENCODE_ZEN_API_KEY"}
+	cfg := Config{Compat: map[string]CompatConfig{
+		"opencode-go": user,
+		"openrouter":  {BaseURL: "https://openrouter.ai/api", APIKeyEnv: "OPENROUTER_API_KEY"},
+	}}
+	merged := cfg.CompatUpstreams()
+	if got := merged["opencode-go"]; got != user {
+		t.Errorf("opencode-go upstream = %+v, want the user entry %+v", got, user)
+	}
+	if _, ok := merged["openrouter"]; !ok {
+		t.Errorf("user-only upstream openrouter missing from %v", merged)
+	}
+	if len(merged) != 2 {
+		t.Errorf("merged upstreams = %v, want exactly the built-in and user names", merged)
+	}
+	if _, ok := cfg.Compat["opencode-go"]; !ok || len(cfg.Compat) != 2 {
+		t.Errorf("CompatUpstreams must not mutate cfg.Compat: %v", cfg.Compat)
+	}
+}
+
+// buildAdapters panics on a compat entry that fails validation. Only config.Load
+// validates the user entries. This test validates the built-in entries.
+func TestBuiltinCompat_EntriesPassValidation(t *testing.T) {
+	for name, upstream := range builtinCompat {
+		if err := openaicompat.ValidateName(name); err != nil {
+			t.Errorf("built-in compat %q: %v", name, err)
+		}
+		if err := openaicompat.ValidateBaseURL(upstream.BaseURL); err != nil {
+			t.Errorf("built-in compat %q base_url: %v", name, err)
+		}
+		if strings.TrimSpace(upstream.APIKeyEnv) == "" {
+			t.Errorf("built-in compat %q has no api_key_env", name)
+		}
+	}
+}
+
 // The tool-schema strip is DEFAULT OFF: it changes model-visible bytes, so only
 // the explicit value "annotations" turns it on and every other spelling —
 // including a bare config and an unrecognized value — normalizes to off.
@@ -356,17 +438,16 @@ func TestLoad_ToolSchemaStripDefaultsOffAndFailsClosed(t *testing.T) {
 	}
 }
 
-// The breakpoint planner is DEFAULT OFF for the same reason: it ships behind the
-// escalation ladder, so only the explicit value "frontier" turns it on and every
-// other spelling normalizes to off.
-func TestLoad_BreakpointPlanDefaultsOffAndFailsClosed(t *testing.T) {
+// Cache planning defaults on in optimization modes. Explicit off and unknown
+// values remain fail-closed off-switches; record mode never runs planner.
+func TestLoad_BreakpointPlanDefaultsFrontierAndFailsClosed(t *testing.T) {
 	t.Setenv("CAVEMAN_BREAKPOINT_PLAN", "")
 	cfg, err := Load(filepath.Join(t.TempDir(), "absent.yaml"))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.BreakpointPlan != "off" {
-		t.Fatalf("bare config breakpoint_plan = %q, want off", cfg.BreakpointPlan)
+	if cfg.BreakpointPlan != "frontier" {
+		t.Fatalf("bare config breakpoint_plan = %q, want frontier", cfg.BreakpointPlan)
 	}
 
 	path := filepath.Join(t.TempDir(), "caveman.yaml")
