@@ -37,13 +37,13 @@ const REPO = 'JuliusBrussee/caveman';
 // fallback path); `tests/installer/node-floor.test.mjs` fails the build if the
 // two drift apart.
 const MIN_NODE_MAJOR = 18;
-// Pin remote fetches to an immutable release tag, not the moving `main`
+// Pin remote fetches to a release tag, not the moving `main`
 // branch (issue #261). A push to main must never silently change what a
 // curl|bash / detached-script install downloads and executes. Bump this to
 // the new tag on every release (CI release step) AFTER regenerating
 // src/hooks/checksums.sha256 so the integrity manifest matches the ref.
 // Overridable via CAVEMAN_REF for testing against a branch.
-const PINNED_REF = process.env.CAVEMAN_REF || 'v2.7.0';
+const PINNED_REF = process.env.CAVEMAN_REF || 'v3.1.0';
 const OPENCLAW_SKILL_VERSION = /^v?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(PINNED_REF)
   ? PINNED_REF.replace(/^v/, '')
   : undefined;
@@ -268,6 +268,7 @@ const PROVIDERS = [
   { id: 'droid',      label: 'Droid (Factory)',     mech: 'npx skills add (droid)',        detect: 'command:droid', profile: 'droid' },
   { id: 'forgecode',  label: 'ForgeCode',           mech: 'npx skills add (forgecode)',    detect: 'command:forge', profile: 'forgecode' },
   { id: 'goose',      label: 'Block Goose',         mech: 'npx skills add (goose)',        detect: 'command:goose', profile: 'goose' },
+  { id: 'grok',       label: 'Grok Build',          mech: 'native skills copy',     detect: 'command:grok' },
   { id: 'iflow',      label: 'iFlow CLI',           mech: 'npx skills add (iflow-cli)',    detect: 'command:iflow', profile: 'iflow-cli' },
   { id: 'kiro',       label: 'Kiro CLI',            mech: 'npx skills add (kiro-cli)',     detect: 'command:kiro-cli||command:kiro', profile: 'kiro-cli' },
   { id: 'mistral',    label: 'Mistral Vibe',        mech: 'npx skills add (mistral-vibe)', detect: 'command:vibe||command:mistral', profile: 'mistral-vibe' },
@@ -737,7 +738,7 @@ function installViaSkills(ctx, prov) {
 
 // ── hermes native install ──────────────────────────────────────────────────
 // Drops the caveman skills into ~/.hermes/skills/productivity/ (or HERMES_HOME if set).
-const HERMES_SKILL_DIRS = ['caveman', 'caveman-commit', 'caveman-review', 'caveman-help', 'caveman-stats', 'caveman-compress', 'cavecrew'];
+const HERMES_SKILL_DIRS = ['caveman', 'ultracave', 'megacave', 'caveman-commit', 'caveman-review', 'caveman-help', 'caveman-stats', 'caveman-compress', 'cavecrew'];
 
 function hermesConfigDir() {
   // Hermes uses ~/.hermes by default, or HERMES_HOME env var.
@@ -803,9 +804,9 @@ function installHermes(ctx) {
 // opencode.json with a "plugin" array entry. Mirrors the Claude Code hook
 // architecture as closely as opencode allows — only the statusline is missing
 // (opencode's TUI exposes no plugin-writable badge).
-const OPENCODE_SKILL_DIRS  = ['caveman', 'caveman-commit', 'caveman-review', 'caveman-help', 'caveman-stats', 'caveman-compress', 'cavecrew'];
+const OPENCODE_SKILL_DIRS  = ['caveman', 'ultracave', 'megacave', 'caveman-commit', 'caveman-review', 'caveman-help', 'caveman-stats', 'caveman-compress', 'cavecrew'];
 const OPENCODE_AGENT_FILES = ['cavecrew-investigator.md', 'cavecrew-builder.md', 'cavecrew-reviewer.md'];
-const OPENCODE_COMMAND_FILES = ['caveman.md', 'caveman-commit.md', 'caveman-review.md', 'caveman-compress.md', 'caveman-stats.md', 'caveman-help.md'];
+const OPENCODE_COMMAND_FILES = ['caveman.md', 'ultracave.md', 'megacave.md', 'caveman-commit.md', 'caveman-review.md', 'caveman-compress.md', 'caveman-stats.md', 'caveman-help.md'];
 const OPENCODE_PLUGIN_REL = './plugins/caveman/plugin.js';
 const OPENCODE_AGENTS_MD_SENTINEL = 'Respond terse like smart caveman';
 // Marker fence for the opencode AGENTS.md ruleset block. Same convention as
@@ -1322,13 +1323,13 @@ async function installHooks(ctx) {
 
   fs.mkdirSync(hooksDir, { recursive: true });
 
-  // Copy or download each hook file. Local-clone-first for offline installs.
-  // Downloaded files (the rare detached-script / curl fallback) are verified
-  // against the SHA-256 manifest published at the pinned release ref (#262);
-  // a mismatch aborts before the file is wired into settings.json. Local
-  // copies are trusted — they come from the same package as this script.
-  let checksums; // undefined = not yet loaded; null = unavailable for this ref
-  let warnedNoChecksums = false;
+  // Copy or download each hook file. Local-clone-first for offline installs;
+  // local copies are trusted — they come from the same package as this script.
+  // Downloaded files (the detached-script / curl fallback) must match the
+  // SHA-256 manifest published at the pinned release ref (#262). They are
+  // staged and all verified before any lands in hooksDir, so a missing
+  // manifest or one bad file aborts with the previous install intact.
+  const plan = [];
   for (const f of HOOK_FILES) {
     const dest = path.join(hooksDir, f);
     if (f === HOOKS_MANIFEST && fs.existsSync(dest) && !hooksManifestIsOurs(dest)) {
@@ -1336,26 +1337,52 @@ async function installHooks(ctx) {
       warn("  caveman's hooks are CommonJS; if that file declares \"type\":\"module\" they will not load.");
       continue;
     }
-    if (sourceDir && fs.existsSync(path.join(sourceDir, f))) {
-      fs.copyFileSync(path.join(sourceDir, f), dest);
-    } else {
-      try { await downloadTo(`${HOOKS_REMOTE}/${f}`, dest); }
-      catch (e) { return `download ${f} failed: ${e.message}`; }
-      if (checksums === undefined) checksums = await loadRemoteHookChecksums();
-      if (checksums) {
-        const want = checksums.get(f);
-        const got = sha256File(dest);
+    const local = sourceDir && path.join(sourceDir, f);
+    plan.push({ f, dest, src: local && fs.existsSync(local) ? local : null });
+  }
+  const remote = plan.filter((item) => !item.src);
+  const scratch = remote.length ? privateTmpDir() : null;
+  try {
+    if (remote.length) {
+      const checksums = await loadRemoteHookChecksums();
+      if (!checksums) {
+        return `no hook integrity manifest at ${PINNED_REF} (${HOOKS_REMOTE}/checksums.sha256) — ` +
+               'refusing to install unverified hooks; nothing changed. Retry, or install from a clone: node bin/install.js';
+      }
+      for (const item of remote) {
+        item.src = path.join(scratch, item.f);
+        try { await downloadTo(`${HOOKS_REMOTE}/${item.f}`, item.src); }
+        catch (e) { return `download ${item.f} failed: ${e.message}; nothing changed`; }
+        const want = checksums.get(item.f);
+        const got = sha256File(item.src);
         if (!want || want !== got) {
-          try { fs.unlinkSync(dest); } catch (_) {}
-          return `integrity check failed for ${f} (expected ${want || '<not in manifest>'}, got ${got}) — ` +
-                 `refusing to install a hook that doesn't match pinned release ${PINNED_REF}`;
+          return `integrity check failed for ${item.f} (expected ${want || '<not in manifest>'}, got ${got}) — ` +
+                 `refusing to install a hook that doesn't match pinned release ${PINNED_REF}; nothing changed`;
         }
-      } else if (!warnedNoChecksums) {
-        warnedNoChecksums = true;
-        warn(`  note: no integrity manifest at ${PINNED_REF} — downloaded hooks installed unverified.`);
       }
     }
-    process.stdout.write(`  installed: ${dest}\n`);
+    // Stage every file beside its destination, then rename each over it: an
+    // ENOSPC/EACCES while copying leaves the previous hooks untouched instead
+    // of a mix of old and new. COPYFILE_EXCL refuses a pre-planted temp name
+    // (symlink included), and rename replaces a symlinked dest rather than
+    // writing through it.
+    const staged = [];
+    try {
+      for (const item of plan) {
+        const tmp = `${item.dest}.tmp-${process.pid}`;
+        staged.push({ tmp, dest: item.dest });
+        fs.copyFileSync(item.src, tmp, fs.constants.COPYFILE_EXCL);
+      }
+    } catch (e) {
+      for (const { tmp } of staged) try { fs.unlinkSync(tmp); } catch (_) { /* best effort */ }
+      return `copying hooks into ${hooksDir} failed: ${e.message}; nothing changed`;
+    }
+    for (const { tmp, dest } of staged) {
+      fs.renameSync(tmp, dest);
+      process.stdout.write(`  installed: ${dest}\n`);
+    }
+  } finally {
+    if (scratch) try { fs.rmSync(scratch, { recursive: true, force: true }); } catch (_) { /* best effort */ }
   }
 
   // chmod statusline (no-op on Windows)
@@ -1544,8 +1571,7 @@ function sha256File(p) {
 
 // Download + parse the hook integrity manifest from the pinned release ref.
 // Returns Map<basename, sha256hex>, or null when the manifest is unavailable
-// (release tags older than this feature predate it) — the caller treats null
-// as "cannot verify" and warns rather than aborting, for back-compat. Parses
+// or empty — the caller then refuses to install downloaded hooks. Parses
 // the standard `sha256sum` text format: "<64-hex>  <path>" (two spaces, or
 // " *<path>" binary marker).
 async function loadRemoteHookChecksums() {
@@ -1764,9 +1790,14 @@ function uninstall(ctx) {
         }
       }
     }
-    // opencode flag file
-    const ocFlag = path.join(ocDir, '.caveman-active');
-    if (fs.existsSync(ocFlag) && !opts.dryRun) { try { fs.unlinkSync(ocFlag); } catch (_) {} }
+    // opencode mode state. Both files, matching the Claude-side stateFiles
+    // sweep below: the plugin writes `.prev` for the one-shot restore, and a
+    // stale one is not inert — a reinstall's first /caveman-commit would read
+    // it as that session's return target.
+    for (const name of ['.caveman-active', '.caveman-active.prev']) {
+      const ocFlag = path.join(ocDir, name);
+      if (fs.existsSync(ocFlag) && !opts.dryRun) { try { fs.unlinkSync(ocFlag); } catch (_) {} }
+    }
   }
 
   // OpenClaw native install — strip skill folder + SOUL.md marker block.
@@ -1844,6 +1875,7 @@ function uninstall(ctx) {
     '.caveman-mode-log.jsonl',
     '.caveman-statusline-suffix',
     '.caveman-nudge-shown',
+    '.caveman-statusline-stale',
   ];
   for (const file of stateFiles) {
     const statePath = path.join(configDir, file);
